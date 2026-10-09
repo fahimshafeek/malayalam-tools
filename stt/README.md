@@ -73,20 +73,24 @@ curl http://localhost:8081/inference \
 ## 🎙️ Live Terminal Transcription
 
 `live_transcribe.py` captures your microphone and streams a live transcript to
-the terminal until you press Ctrl+C. There is **no voice-activity threshold** —
-audio is transcribed continuously so nothing gets clipped, and a live readout
-shows the raw level (`rms`, `dBFS`, `peak`) so you can see the real numbers. It
-talks to the same server, so start the container first.
+the terminal until you press Ctrl+C. A **voice gate** (set automatically from
+your background at startup) drops silence and low-level noise so nearby chatter
+isn't transcribed. A live meter shows the raw level (`rms`, `dBFS`, `peak`) and
+the gate, and you can move the gate while it runs:
+
+- `+` / `-` raise / lower the gate until the meter lights up only for your voice
+- `r` re-measure the background
+- `Ctrl+C` quit
 
 ```bash
-.venv/bin/python live_transcribe.py                       # Malayalam (default)
-.venv/bin/python live_transcribe.py --device plughw:2,0   # pick a mic
+.venv/bin/python live_transcribe.py                         # auto gate
+.venv/bin/python live_transcribe.py --threshold-rms 0.06    # fix the gate
+.venv/bin/python live_transcribe.py --noise-multiplier 4    # more aggressive
 .venv/bin/python live_transcribe.py --list-devices
-.venv/bin/python live_transcribe.py --preview 3 --step 0.5  # snappier preview
 ```
 
-Requirements: `arecord` (package `alsa-utils`) and `numpy`. Transcription speed
-is limited by the server — the GPU build is much faster than CPU.
+Requirements: `arecord` (package `alsa-utils`) and `numpy`. Start the server
+first; the GPU build gives near real-time updates.
 
 ## ❤️ Credits & Acknowledgements
 

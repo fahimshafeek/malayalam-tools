@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
-live_transcribe.py — continuous, live transcription in the terminal.
+live_transcribe.py — live transcription with a voice gate you can tune.
 
-No voice-activity threshold is used: audio is transcribed continuously, so
-nothing gets clipped. The terminal shows a live, self-updating view:
+Only speech is sent to the model: a lightweight energy gate drops silence and
+low-level background so nearby chatter / noise doesn't get transcribed. The
+terminal shows a live meter and lets you move the gate while you watch:
 
-    <recent transcript>                <- last lines of the current segment
-    [████████░░░░░░░░░░░░] rms 0.0512 (-25.8 dBFS)  peak 0.8701  buf 6.3s
+    ഹലോ ഞാൻ പറയുന്നത് …                       <- live preview of the utterance
+    [██████░░░░░░░░░░░░░░] rms 0.0421 (-27.5 dBFS)  peak 0.2100  thr 0.0800  ● speech
+    +/- adjust gate    r recalibrate    Ctrl+C stop
 
-The bottom line is the raw, real-time level readout — use it to see the actual
-numbers while you speak vs. stay quiet.
+Press ``+`` / ``-`` to raise / lower the speech gate until the meter only lights
+up when *you* talk. ``r`` re-measures the background. The gate is remembered in
+place, so you can dial it in live.
 
 How it works
 ------------
-* ``arecord`` streams raw 16 kHz mono PCM from the microphone on a background
-  thread.
-* Audio accumulates into a segment. Every ``--step`` seconds the whole segment
-  is re-transcribed and the view is refreshed, so the transcript grows live.
-* When the segment reaches ``--window`` seconds it is "committed" (printed as a
-  normal line above the live view) and a new segment starts. This bounds
-  latency and keeps the transcript from growing forever.
-* Transcription runs on a worker thread, so the meter and Ctrl+C stay
-  responsive.
-
-There are deliberately **no thresholds** here. Once the numbers are known, a
-proper segmenter can be added back.
+* ``arecord`` streams raw 16 kHz mono PCM on a background thread.
+* At startup the background is measured once to set the gate automatically.
+* A frame is "speech" when its RMS is above the gate (with hysteresis and a
+  short attack so clicks don't trigger it). Speech is collected into an
+  utterance; a short pause ends it, and the utterance is transcribed and
+  printed. While you speak, the growing utterance is previewed live.
+* Transcription runs on a worker thread, so the meter and keys stay responsive.
 
 Usage
 -----
     .venv/bin/python live_transcribe.py
-    .venv/bin/python live_transcribe.py --window 12 --step 1.0
+    .venv/bin/python live_transcribe.py --threshold-rms 0.05   # fix the gate
+    .venv/bin/python live_transcribe.py --noise-multiplier 4   # more aggressive
     .venv/bin/python live_transcribe.py --list-devices
 
 Requires: ``arecord`` (alsa-utils), ``numpy``, and a running whisper.cpp server
@@ -43,13 +42,16 @@ import io
 import json
 import math
 import queue
+import select
 import shutil
 import signal
 import subprocess
 import sys
+import termios
 import textwrap
 import threading
 import time
+import tty
 import urllib.error
 import urllib.request
 import uuid
@@ -88,7 +90,6 @@ class MicCapture:
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
         )
-        # Give arecord a moment to fail fast on a bad device.
         time.sleep(0.3)
         if self._proc.poll() is not None:
             err = (self._proc.stderr.read() or b"").decode(errors="replace").strip()
@@ -150,7 +151,6 @@ def transcribe(server: str, audio: np.ndarray, sample_rate: int, language: str,
     """POST a float32 clip to the whisper.cpp server and return its text."""
     boundary = "----livestt" + uuid.uuid4().hex
     wav = _encode_wav(audio, sample_rate)
-
     body = io.BytesIO()
 
     def field(name: str, value: str) -> None:
@@ -185,12 +185,11 @@ def transcribe(server: str, audio: np.ndarray, sample_rate: int, language: str,
 
 
 def check_server(server: str) -> None:
-    """Fail fast with a clear message if the server is unreachable."""
     base = server.rsplit("/", 1)[0] or server
     try:
         urllib.request.urlopen(base, timeout=5)
     except urllib.error.HTTPError:
-        return  # reachable, just returned an error status (e.g. 404 on "/")
+        return
     except Exception as exc:
         raise RuntimeError(
             f"Cannot reach the whisper.cpp server at {server!r} ({exc}).\n"
@@ -199,18 +198,16 @@ def check_server(server: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Terminal live view (redraws a block of lines in place)                       #
+# Terminal live view                                                           #
 # --------------------------------------------------------------------------- #
 class LiveDisplay:
-    """A block of lines at the bottom of the terminal that can be redrawn."""
-
     def __init__(self) -> None:
-        self.n = 0  # number of lines currently drawn
+        self.n = 0
 
     def render(self, lines: list[str]) -> None:
         out = []
         if self.n:
-            out.append(f"\x1b[{self.n}A")  # move cursor up to the block start
+            out.append(f"\x1b[{self.n}A")
         for line in lines:
             out.append("\r\x1b[2K" + line + "\n")
         sys.stdout.write("".join(out))
@@ -230,40 +227,53 @@ class LiveDisplay:
 
 
 # --------------------------------------------------------------------------- #
-# Live transcription (no thresholds)                                           #
+# Live transcription with a tunable speech gate                                #
 # --------------------------------------------------------------------------- #
 class LiveTranscriber:
+    FRAME_SECONDS = 0.02  # 20 ms
+
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.rate = args.sample_rate
+        self.frame = int(self.FRAME_SECONDS * self.rate)
+        self.preroll_len = int(0.4 * self.rate)   # keep 400 ms before speech
+        self.attack_frames = max(1, int(args.attack / self.FRAME_SECONDS))
 
-        self.buffer = np.zeros(0, dtype=np.float32)
+        self.preroll = np.zeros(0, dtype=np.float32)
+        self.utter: list[np.ndarray] = []
+        self.speech_samples = 0
+        self.silence_run = 0.0
+        self.hot_run = 0
+        self.in_speech = False
+
+        self.noise_floor = 0.01
+        self.threshold = args.threshold_rms if args.threshold_rms else 0.02
+        self.pending = np.zeros(0, dtype=np.float32)
         self.rms = 0.0
         self.peak = 0.0
         self.text = ""
-        self.gen = 0  # bumped on every commit so stale results are ignored
+        self.gen = 0
 
         self.capture = MicCapture(args.device, self.rate)
         self.display = LiveDisplay()
         self._out_lock = threading.Lock()
 
         self._cv = threading.Condition()
-        self._mailbox: tuple[np.ndarray, int] | None = None
+        self._mailbox: tuple[np.ndarray, bool, int] | None = None
+        self._busy = False
+        self._result: tuple[str, bool, int] | None = None
         self._quit = threading.Event()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
-
-        self._busy = False          # a transcription request is in flight
-        self._committing = False    # current request is the "commit" snapshot
-        self._submitted_len = 0     # buffer length of the in-flight snapshot
-        self._last_submit = 0.0
+        self._last_partial = 0.0
+        self._old_term = None
 
     # -- worker ------------------------------------------------------------- #
-    def _submit(self, audio: np.ndarray, gen: int) -> None:
+    def _submit(self, audio: np.ndarray, is_final: bool, gen: int) -> None:
         with self._cv:
             if self._busy:
-                return  # one transcription at a time; newer audio stays buffered
+                return
             self._busy = True
-            self._mailbox = (audio, gen)
+            self._mailbox = (audio, is_final, gen)
             self._cv.notify()
 
     def _worker_loop(self) -> None:
@@ -273,94 +283,177 @@ class LiveTranscriber:
                     self._cv.wait(0.2)
                 if self._mailbox is None and self._quit.is_set():
                     return
-                audio, gen = self._mailbox
+                audio, is_final, gen = self._mailbox
                 self._mailbox = None
-
             seconds = audio.shape[0] / self.rate
-            timeout = max(30.0, seconds * 3.0 + 15.0)
             try:
-                text = transcribe(
-                    self.args.server, audio, self.rate, self.args.language, timeout=timeout
-                )
+                text = transcribe(self.args.server, audio, self.rate,
+                                  self.args.language, timeout=max(30.0, seconds * 3 + 15))
             except Exception:
-                text = self.text
-
+                text = ""
             with self._cv:
-                if gen == self.gen:  # drop results for an already-committed segment
-                    self.text = text
+                self._result = (text, is_final, gen)
                 self._busy = False
 
+    # -- keyboard ----------------------------------------------------------- #
+    def _read_key(self) -> str | None:
+        if not sys.stdin.isatty():
+            return None
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if not r:
+            return None
+        return sys.stdin.read(1)
+
+    def _handle_key(self, key: str) -> None:
+        if key in ("+", "="):
+            self.threshold = min(0.9, self.threshold * 1.15)
+        elif key in ("-", "_"):
+            self.threshold = max(0.001, self.threshold / 1.15)
+        elif key in ("r", "R"):
+            self._calibrate()
+        elif key in ("q", "Q"):
+            raise KeyboardInterrupt
+
     # -- rendering ---------------------------------------------------------- #
+    def _db(self, value: float) -> float:
+        return 20.0 * math.log10(value) if value > 1e-7 else -140.0
+
     def _status_line(self) -> str:
-        rms = self.rms
-        db = 20.0 * math.log10(rms) if rms > 1e-7 else -140.0
         width = 20
-        frac = max(0.0, min(1.0, (db + 60.0) / 60.0))
+        frac = max(0.0, min(1.0, (self._db(self.rms) + 60.0) / 60.0))
         filled = int(frac * width)
         bar = "█" * filled + "░" * (width - filled)
+        state = "● speech" if self.in_speech else "○ quiet"
         return (
-            f"[{bar}] rms {rms:.4f} ({db:5.1f} dBFS)  "
-            f"peak {self.peak:.4f}  buf {self.buffer.shape[0] / self.rate:4.1f}s"
+            f"[{bar}] rms {self.rms:.4f} ({self._db(self.rms):5.1f} dBFS)  "
+            f"peak {self.peak:.4f}  thr {self.threshold:.4f} "
+            f"({self._db(self.threshold):5.1f} dBFS)  {state}"
         )
 
     def _draw(self) -> None:
-        cols, rows = shutil.get_terminal_size((90, 24))
-        max_lines = max(1, rows - 3)
+        cols, rows = shutil.get_terminal_size((100, 24))
+        max_lines = max(1, rows - 4)
         wrapped: list[str] = []
         for para in (self.text or "").splitlines() or [""]:
             wrapped.extend(textwrap.wrap(para, width=max(20, cols - 4)) or [""])
-        shown = wrapped[-max_lines:] if wrapped and any(wrapped) else ["(listening…)"]
-        lines = ["  " + s for s in shown] + ["  " + self._status_line()]
+        shown = wrapped[-max_lines:] if wrapped and any(wrapped) else [""]
+        lines = (
+            ["  " + s for s in shown]
+            + ["  " + self._status_line()]
+            + ["  +/- adjust gate   r recalibrate   Ctrl+C stop"]
+        )
         with self._out_lock:
             self.display.render(lines)
 
-    # -- commit ------------------------------------------------------------- #
-    def _flush(self) -> None:
-        """Print the current segment as a normal line and start a new one."""
-        with self._cv:
-            text = self.text.strip()
-            self.gen += 1
-            self.text = ""
-        # Keep any audio captured after the committed snapshot for the next segment.
-        keep = min(self._submitted_len, self.buffer.shape[0])
-        self.buffer = self.buffer[keep:]
-        self._submitted_len = 0
-        self._last_submit = time.time()
-        self._committing = False
-        with self._out_lock:
-            self.display.clear()
-            if text:
-                print(text, flush=True)
+    # -- VAD ---------------------------------------------------------------- #
+    def _process_frame(self, frame: np.ndarray) -> None:
+        rms = float(np.sqrt(np.mean(frame * frame)))
+        start_thr = self.threshold
+        end_thr = start_thr * 0.6  # hysteresis: easier to keep talking than to start
+
+        if not self.in_speech:
+            if rms < start_thr:
+                self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms
+            self.preroll = (
+                frame if self.preroll.size == 0
+                else np.concatenate((self.preroll, frame))
+            )
+            if self.preroll.shape[0] > self.preroll_len:
+                self.preroll = self.preroll[-self.preroll_len:]
+            self.hot_run = self.hot_run + 1 if rms > start_thr else 0
+            if self.hot_run >= self.attack_frames:
+                self.in_speech = True
+                self.utter = [self.preroll.copy()]
+                self.speech_samples = 0
+                self.silence_run = 0.0
+                self.hot_run = 0
+                self._last_partial = 0.0
+        else:
+            self.utter.append(frame)
+            self.speech_samples += frame.shape[0]
+            self.silence_run = 0.0 if rms > end_thr else self.silence_run + self.FRAME_SECONDS
+
+    def _utterance_audio(self) -> np.ndarray:
+        return np.concatenate(self.utter) if self.utter else np.zeros(0, dtype=np.float32)
+
+    def _end_utterance(self) -> None:
+        audio = self._utterance_audio()
+        if audio.shape[0] >= int(self.args.min_speech * self.rate):
+            self._submit(audio, is_final=True, gen=self.gen)
+        self.gen += 1
+        self.utter = []
+        self.speech_samples = 0
+        self.silence_run = 0.0
+        self.in_speech = False
+        self.text = ""
+
+    def _calibrate(self) -> None:
+        """Measure the background and set the gate above it."""
+        frames: list[float] = []
+        deadline = time.time() + self.args.calibrate
+        while time.time() < deadline:
+            chunk = self.capture.drain()
+            if chunk is None or not chunk.size:
+                time.sleep(0.02)
+                continue
+            n = chunk.shape[0] // self.frame
+            for i in range(n):
+                f = chunk[i * self.frame:(i + 1) * self.frame]
+                frames.append(float(np.sqrt(np.mean(f * f))))
+        if frames:
+            self.noise_floor = float(np.median(frames))
+        if self.args.threshold_rms is None:
+            self.threshold = max(self.args.energy_threshold,
+                                 self.noise_floor * self.args.noise_multiplier)
 
     # -- main loop ---------------------------------------------------------- #
     def _pump(self) -> None:
+        # keys (live gate tuning)
+        while True:
+            key = self._read_key()
+            if key is None:
+                break
+            self._handle_key(key)
+
         chunk = self.capture.drain()
         if chunk is not None and chunk.size:
-            self.buffer = np.concatenate((self.buffer, chunk))
+            self.pending = chunk if self.pending.size == 0 else np.concatenate((self.pending, chunk))
             self.rms = float(np.sqrt(np.mean(chunk * chunk)))
             self.peak = float(np.max(np.abs(chunk)))
 
-        now = time.time()
-        if not self._busy:
-            secs = self.buffer.shape[0] / self.rate
-            if self._committing:
-                # The full-segment snapshot is ready: commit it and start over.
-                self._flush()
-            elif secs >= self.args.window:
-                # Grab a final snapshot of the whole segment, then commit when done.
-                self._submitted_len = self.buffer.shape[0]
-                self._submit(self.buffer.copy(), self.gen)
-                self._last_submit = now
-                self._committing = True
-            elif now - self._last_submit >= self.args.step and self.buffer.shape[0] > 0:
-                # Live preview: transcribe only the most recent `--preview`
-                # seconds so each request stays small and updates stay snappy.
-                n = min(self.buffer.shape[0], int(self.args.preview * self.rate))
-                self._submit(self.buffer[-n:].copy(), self.gen)
-                self._last_submit = now
+        while self.pending.shape[0] >= self.frame:
+            frame = self.pending[: self.frame]
+            self.pending = self.pending[self.frame:]
+            self._process_frame(frame)
+
+        if self.in_speech:
+            now = time.time()
+            if self.silence_run >= self.args.end_silence or \
+                    self.speech_samples / self.rate >= self.args.max_utterance:
+                self._end_utterance()
+            elif now - self._last_partial >= self.args.partial_interval and \
+                    self.speech_samples >= int(self.args.min_speech * self.rate):
+                self._last_partial = now
+                self._submit(self._utterance_audio(), is_final=False, gen=self.gen)
+
+        # worker results
+        result = None
+        with self._cv:
+            if self._result is not None:
+                result = self._result
+                self._result = None
+        if result is not None:
+            text, is_final, gen = result
+            if is_final:
+                with self._out_lock:
+                    self.display.clear()
+                    if text.strip():
+                        print(text.strip(), flush=True)
+            elif gen == self.gen:
+                self.text = text
 
         self._draw()
-        time.sleep(0.05)
+        time.sleep(0.03)
 
     def run(self) -> int:
         try:
@@ -368,7 +461,6 @@ class LiveTranscriber:
         except RuntimeError as exc:
             print(f"❌ {exc}")
             return 1
-
         try:
             self.capture.start()
         except Exception as exc:
@@ -377,7 +469,14 @@ class LiveTranscriber:
             return 1
 
         self._worker.start()
-        print("Speak now: (Ctrl+C to stop)    [no thresholds — continuous stream]\n",
+        self._calibrate()
+
+        if sys.stdin.isatty():
+            self._old_term = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+
+        print(f"Speak now: (Ctrl+C to stop)   "
+              f"[gate {self.threshold:.4f} / {self._db(self.threshold):.1f} dBFS]\n",
               flush=True)
 
         try:
@@ -391,11 +490,12 @@ class LiveTranscriber:
             self._worker.join(timeout=2)
             with self._out_lock:
                 self.display.clear()
-                final = self.text.strip()
-                if final:
-                    print(final, flush=True)
+                if self.text.strip():
+                    print(self.text.strip(), flush=True)
                 print("\n👋 stopped.", flush=True)
         finally:
+            if self._old_term is not None:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_term)
             self.capture.stop()
         return 0
 
@@ -414,25 +514,35 @@ def list_devices() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Continuous live speech-to-text in the terminal (no thresholds).",
+        description="Live speech-to-text with a tunable voice gate (Malayalam/English).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--server", default=DEFAULT_SERVER,
-                   help="whisper.cpp /inference endpoint")
+    p.add_argument("--server", default=DEFAULT_SERVER, help="whisper.cpp /inference endpoint")
     p.add_argument("--language", default="ml",
                    help="language code passed to the server ('ml', 'en', or 'auto')")
-    p.add_argument("--device", default="default",
-                   help="ALSA capture device for arecord")
-    p.add_argument("--sample-rate", type=int, default=SAMPLE_RATE,
-                   help="capture sample rate in Hz")
-    p.add_argument("--window", type=float, default=6.0,
-                   help="commit the segment (and start a new line) after this many seconds")
-    p.add_argument("--step", type=float, default=0.5,
-                   help="re-transcribe the current segment this often (s)")
-    p.add_argument("--preview", type=float, default=4.0,
-                   help="max seconds of recent audio used for the live preview (smaller = snappier)")
-    p.add_argument("--list-devices", action="store_true",
-                   help="list microphones and exit")
+    p.add_argument("--device", default="default", help="ALSA capture device for arecord")
+    p.add_argument("--sample-rate", type=int, default=SAMPLE_RATE, help="capture sample rate (Hz)")
+
+    g = p.add_argument_group("voice gate")
+    g.add_argument("--threshold-rms", type=float, default=None,
+                   help="fix the speech gate to this RMS (skips auto-calibration)")
+    g.add_argument("--noise-multiplier", type=float, default=3.0,
+                   help="auto gate = measured background * this")
+    g.add_argument("--energy-threshold", type=float, default=0.008,
+                   help="absolute minimum gate")
+    g.add_argument("--calibrate", type=float, default=1.2,
+                   help="seconds of background measured at startup")
+    g.add_argument("--attack", type=float, default=0.12,
+                   help="how long energy must persist to start an utterance (s)")
+    g.add_argument("--end-silence", type=float, default=0.6,
+                   help="silence that ends an utterance (s)")
+    g.add_argument("--min-speech", type=float, default=0.3,
+                   help="minimum speech length to transcribe (s)")
+    g.add_argument("--max-utterance", type=float, default=20.0,
+                   help="force-flush an utterance after this long (s)")
+    g.add_argument("--partial-interval", type=float, default=0.8,
+                   help="how often to preview the utterance (s)")
+    p.add_argument("--list-devices", action="store_true", help="list microphones and exit")
     return p
 
 
