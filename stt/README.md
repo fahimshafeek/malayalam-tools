@@ -82,7 +82,7 @@ talks to the same server, so start the container first.
 .venv/bin/python live_transcribe.py                       # Malayalam (default)
 .venv/bin/python live_transcribe.py --device plughw:2,0   # pick a mic
 .venv/bin/python live_transcribe.py --list-devices
-.venv/bin/python live_transcribe.py --window 12 --step 1  # commit cadence
+.venv/bin/python live_transcribe.py --preview 3 --step 0.5  # snappier preview
 ```
 
 Requirements: `arecord` (package `alsa-utils`) and `numpy`. Transcription speed

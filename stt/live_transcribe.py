@@ -353,9 +353,10 @@ class LiveTranscriber:
                 self._last_submit = now
                 self._committing = True
             elif now - self._last_submit >= self.args.step and self.buffer.shape[0] > 0:
-                # Live preview of the growing segment.
-                self._submitted_len = self.buffer.shape[0]
-                self._submit(self.buffer.copy(), self.gen)
+                # Live preview: transcribe only the most recent `--preview`
+                # seconds so each request stays small and updates stay snappy.
+                n = min(self.buffer.shape[0], int(self.args.preview * self.rate))
+                self._submit(self.buffer[-n:].copy(), self.gen)
                 self._last_submit = now
 
         self._draw()
@@ -424,10 +425,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ALSA capture device for arecord")
     p.add_argument("--sample-rate", type=int, default=SAMPLE_RATE,
                    help="capture sample rate in Hz")
-    p.add_argument("--window", type=float, default=8.0,
+    p.add_argument("--window", type=float, default=6.0,
                    help="commit the segment (and start a new line) after this many seconds")
-    p.add_argument("--step", type=float, default=1.0,
+    p.add_argument("--step", type=float, default=0.5,
                    help="re-transcribe the current segment this often (s)")
+    p.add_argument("--preview", type=float, default=4.0,
+                   help="max seconds of recent audio used for the live preview (smaller = snappier)")
     p.add_argument("--list-devices", action="store_true",
                    help="list microphones and exit")
     return p
