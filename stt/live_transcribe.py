@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-live_transcribe.py — record a short clip and transcribe it.
+live_transcribe.py — near-live transcription, cut on pauses.
 
-Simple test mode: capture a fixed number of seconds of microphone audio, send
-it to the whisper.cpp server, and print the transcript. No live streaming, no
-voice gate.
+Records continuously (indefinitely) until Ctrl+C. pydub is used to slice the
+incoming audio on short pauses between words/phrases; each finished slice is
+sent to the whisper.cpp server and printed as soon as it comes back:
 
-    $ .venv/bin/python live_transcribe.py
-    🎙️  Recording 5.0s — speak now
-    ⏹️  captured 5.00s  rms 0.0432 (-27.3 dBFS)  peak 0.3100
-    📝 ഹലോ ...
+    🎙️  Listening… (Ctrl+C to stop)   [pause ≥ 400ms, threshold -34.0 dBFS]
+    📝 ഹലോ ഞാൻ പറയുന്നത് മനസ്സിലാവുന്നുണ്ടോ
+    📝 എന്റെ പേര് ഹരി എന്നാണ്
+
+At startup the background level is measured and the silence threshold is set
+just above it (override with ``--silence-thresh``). Cutting only happens on
+pauses at least ``--min-silence`` ms long, so words aren't split mid-phrase.
 
 Options
 -------
-    .venv/bin/python live_transcribe.py --seconds 5
-    .venv/bin/python live_transcribe.py --loop          # repeat until Ctrl+C
+    .venv/bin/python live_transcribe.py
+    .venv/bin/python live_transcribe.py --min-silence 300
+    .venv/bin/python live_transcribe.py --silence-thresh -38
     .venv/bin/python live_transcribe.py --language ml
     .venv/bin/python live_transcribe.py --list-devices
 
-Requires: ``arecord`` (alsa-utils), ``numpy``, and a running whisper.cpp server
-(default http://localhost:8081/inference).
+Requires: ``arecord`` (alsa-utils), ``numpy``, ``pydub``, and a running
+whisper.cpp server (default http://localhost:8081/inference).
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import json
 import math
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -40,6 +45,8 @@ import uuid
 import wave
 
 import numpy as np
+from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 
 SAMPLE_RATE = 16_000
 DEFAULT_SERVER = "http://localhost:8081/inference"
@@ -98,12 +105,6 @@ class MicCapture:
         if not parts:
             return None
         return parts[0] if len(parts) == 1 else np.concatenate(parts)
-
-    def get(self, timeout: float = 0.5) -> np.ndarray | None:
-        try:
-            return self._queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
 
     def stop(self) -> None:
         self._stop.set()
@@ -185,57 +186,171 @@ def check_server(server: str) -> None:
         )
 
 
-# --------------------------------------------------------------------------- #
-# Record + transcribe                                                          #
-# --------------------------------------------------------------------------- #
 def db(value: float) -> float:
     return 20.0 * math.log10(value) if value > 1e-7 else -140.0
 
 
-def record(capture: MicCapture, seconds: float, sample_rate: int) -> np.ndarray:
-    """Collect exactly `seconds` of audio from the capture queue."""
-    target = int(seconds * sample_rate)
-    frames: list[np.ndarray] = []
-    got = 0
-    while got < target:
-        chunk = capture.get(timeout=0.5)
-        if chunk is None:
-            continue
-        frames.append(chunk)
-        got += chunk.shape[0]
-    if not frames:
-        return np.zeros(0, dtype=np.float32)
-    return np.concatenate(frames)[:target]
+# --------------------------------------------------------------------------- #
+# Near-live segmenter                                                          #
+# --------------------------------------------------------------------------- #
+class LiveTranscriber:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.sr = args.sample_rate
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.ambient_dbfs = -60.0
+        self.thresh = args.silence_thresh if args.silence_thresh is not None else -40.0
+
+        self.capture = MicCapture(args.device, self.sr)
+        self.tx_queue: "queue.Queue[np.ndarray | None]" = queue.Queue()
+        self._quit = threading.Event()
+        self._worker = threading.Thread(target=self._tx_loop, daemon=True)
+        self._last_process = 0.0
+
+    # -- transcription worker ---------------------------------------------- #
+    def _tx_loop(self) -> None:
+        while True:
+            audio = self.tx_queue.get()
+            if audio is None:
+                return
+            seconds = audio.shape[0] / self.sr
+            try:
+                text = transcribe(self.args.server, audio, self.sr, self.args.language,
+                                  timeout=max(30.0, seconds * 3 + 15))
+            except Exception as exc:
+                print(f"⚠️  transcription failed: {exc}", flush=True)
+                continue
+            text = text.strip()
+            if text:
+                print(f"📝 {text}", flush=True)
+
+    # -- segmentation ------------------------------------------------------- #
+    def _emit(self, start_ms: float, end_ms: float) -> None:
+        a = max(0, int(start_ms * self.sr / 1000))
+        b = min(self.pending.shape[0], int(end_ms * self.sr / 1000))
+        if b - a < int(self.args.min_segment * self.sr / 1000):
+            return
+        self.tx_queue.put(self.pending[a:b].copy())
+
+    def _crop(self, keep_from_ms: float) -> None:
+        start = max(0, min(self.pending.shape[0], int(keep_from_ms * self.sr / 1000)))
+        self.pending = self.pending[start:]
+
+    def _process(self) -> None:
+        if self.pending.shape[0] < int(0.05 * self.sr):
+            return
+        pcm = (np.clip(self.pending, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        seg = AudioSegment(data=pcm, sample_width=2, frame_rate=self.sr, channels=1)
+        total = len(seg)  # ms
+
+        ranges = detect_nonsilent(
+            seg,
+            min_silence_len=self.args.min_silence,
+            silence_thresh=self.thresh,
+            seek_step=self.args.seek_step,
+        )
+
+        if not ranges:
+            # All silence: drop it, but keep a short tail to preserve a word start.
+            keep = min(total, self.args.keep_silence)
+            self._crop(total - keep)
+            return
+
+        last_start, last_end = ranges[-1]
+        trailing = total - last_end
+
+        if trailing >= self.args.min_silence:
+            # The last utterance is also followed by a long enough pause: commit all.
+            completed = ranges
+            keep_ms = total
+        else:
+            # The last utterance is still in progress: commit the earlier ones.
+            completed = ranges[:-1]
+            keep_ms = max(0, last_start - self.args.keep_silence)
+
+        for start, end in completed:
+            pad_a = max(0, start - self.args.keep_silence)
+            pad_b = min(total, end + self.args.keep_silence)
+            self._emit(pad_a, pad_b)
+
+        # If a single utterance drags on with no pause, force-flush it in chunks.
+        if trailing < self.args.min_silence:
+            in_progress = total - last_start
+            if in_progress >= self.args.max_segment * 1000:
+                cut = last_start + self.args.max_segment * 1000
+                self._emit(last_start, cut)
+                keep_ms = cut
+
+        self._crop(keep_ms)
+
+    # -- calibrate + run ---------------------------------------------------- #
+    def _calibrate(self) -> None:
+        print("🎚️  measuring background noise — stay quiet…", flush=True)
+        deadline = time.time() + self.args.calibrate
+        parts: list[np.ndarray] = []
+        while time.time() < deadline:
+            chunk = self.capture.drain()
+            if chunk is None:
+                time.sleep(0.02)
+                continue
+            parts.append(chunk)
+        if parts:
+            audio = np.concatenate(parts)
+            self.ambient_dbfs = db(float(np.sqrt(np.mean(audio * audio))))
+        else:
+            self.ambient_dbfs = -60.0
+        if self.args.silence_thresh is None:
+            self.thresh = max(-60.0, min(-3.0, self.ambient_dbfs + self.args.thresh_margin))
+
+    def run(self) -> int:
+        try:
+            check_server(self.args.server)
+        except RuntimeError as exc:
+            print(f"❌ {exc}")
+            return 1
+        try:
+            self.capture.start()
+        except Exception as exc:
+            print(f"❌ Could not open the microphone ({self.args.device!r}): {exc}")
+            print("   Try `--list-devices` and pass `--device <name>`.")
+            return 1
+
+        self._calibrate()
+        self._worker.start()
+        print(
+            f"🎙️  Listening… (Ctrl+C to stop)   "
+            f"[pause ≥ {self.args.min_silence}ms, "
+            f"threshold {self.thresh:.1f} dBFS "
+            f"(ambient {self.ambient_dbfs:.1f})]\n",
+            flush=True,
+        )
+
+        try:
+            while True:
+                chunk = self.capture.drain()
+                if chunk is not None and chunk.size:
+                    self.pending = (
+                        chunk if self.pending.size == 0
+                        else np.concatenate((self.pending, chunk))
+                    )
+                now = time.time()
+                if now - self._last_process >= self.args.process_interval:
+                    self._last_process = now
+                    self._process()
+                time.sleep(0.02)
+        except KeyboardInterrupt:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            self.tx_queue.put(None)
+            self._worker.join(timeout=5)
+            print("\n👋 stopped.", flush=True)
+        finally:
+            self.capture.stop()
+        return 0
 
 
-def run_once(args: argparse.Namespace, capture: MicCapture) -> None:
-    print(f"🎙️  Recording {args.seconds:.1f}s — speak now", flush=True)
-    audio = record(capture, args.seconds, args.sample_rate)
-
-    if audio.size == 0:
-        print("⚠️  No audio captured.")
-        return
-
-    rms = float(np.sqrt(np.mean(audio * audio)))
-    peak = float(np.max(np.abs(audio)))
-    print(
-        f"⏹️  captured {audio.shape[0] / args.sample_rate:.2f}s  "
-        f"rms {rms:.4f} ({db(rms):5.1f} dBFS)  peak {peak:.4f}",
-        flush=True,
-    )
-
-    started = time.time()
-    try:
-        text = transcribe(args.server, audio, args.sample_rate, args.language)
-    except Exception as exc:
-        print(f"⚠️  transcription failed: {exc}", flush=True)
-        return
-    elapsed = time.time() - started
-    rtf = (audio.shape[0] / args.sample_rate) / elapsed if elapsed else 0.0
-    print(f"📝 {text if text else '(nothing recognised)'}", flush=True)
-    print(f"   transcribed in {elapsed:.2f}s ({rtf:.1f}x realtime)\n", flush=True)
-
-
+# --------------------------------------------------------------------------- #
+# CLI                                                                          #
+# --------------------------------------------------------------------------- #
 def list_devices() -> None:
     print("=== ALSA capture devices (`arecord -l`) ===")
     if shutil.which("arecord"):
@@ -247,16 +362,34 @@ def list_devices() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Record a short clip and transcribe it (Malayalam/English).",
+        description="Near-live transcription that cuts on pauses (Malayalam/English).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--seconds", type=float, default=5.0, help="clip length to record")
-    p.add_argument("--loop", action="store_true", help="record + transcribe repeatedly until Ctrl+C")
     p.add_argument("--server", default=DEFAULT_SERVER, help="whisper.cpp /inference endpoint")
     p.add_argument("--language", default="ml",
                    help="language code passed to the server ('ml', 'en', or 'auto')")
     p.add_argument("--device", default="default", help="ALSA capture device for arecord")
     p.add_argument("--sample-rate", type=int, default=SAMPLE_RATE, help="capture sample rate (Hz)")
+
+    g = p.add_argument_group("segmentation (pydub)")
+    g.add_argument("--min-silence", type=int, default=400,
+                   help="pause length (ms) that cuts an utterance")
+    g.add_argument("--keep-silence", type=int, default=200,
+                   help="silence (ms) kept around each slice")
+    g.add_argument("--silence-thresh", type=float, default=None,
+                   help="silence threshold in dBFS (default: auto from background)")
+    g.add_argument("--thresh-margin", type=float, default=4.0,
+                   help="auto threshold = background + this many dB")
+    g.add_argument("--calibrate", type=float, default=1.0,
+                   help="seconds of background measured at startup")
+    g.add_argument("--seek-step", type=int, default=20,
+                   help="pydub detection step (ms); larger = cheaper")
+    g.add_argument("--max-segment", type=float, default=12.0,
+                   help="force-flush an utterance after this long (s)")
+    g.add_argument("--min-segment", type=float, default=0.25,
+                   help="ignore slices shorter than this (s)")
+    g.add_argument("--process-interval", type=float, default=0.15,
+                   help="how often to look for pauses (s)")
     p.add_argument("--list-devices", action="store_true", help="list microphones and exit")
     return p
 
@@ -266,31 +399,7 @@ def main() -> int:
     if args.list_devices:
         list_devices()
         return 0
-
-    try:
-        check_server(args.server)
-    except RuntimeError as exc:
-        print(f"❌ {exc}")
-        return 1
-
-    capture = MicCapture(args.device, args.sample_rate)
-    try:
-        capture.start()
-    except Exception as exc:
-        print(f"❌ Could not open the microphone ({args.device!r}): {exc}")
-        print("   Try `--list-devices` and pass `--device <name>`.")
-        return 1
-
-    try:
-        while True:
-            run_once(args, capture)
-            if not args.loop:
-                break
-    except KeyboardInterrupt:
-        print("\n👋 stopped.")
-    finally:
-        capture.stop()
-    return 0
+    return LiveTranscriber(args).run()
 
 
 if __name__ == "__main__":

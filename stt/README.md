@@ -72,19 +72,20 @@ curl http://localhost:8081/inference \
 
 ## 🎙️ Live Terminal Transcription
 
-`live_transcribe.py` records a short clip and transcribes it — handy for quick
-testing.
+`live_transcribe.py` records continuously (indefinitely, until Ctrl+C) and cuts
+the audio on short pauses between words/phrases using **pydub**; each finished
+slice is transcribed and printed as soon as it's ready — near-live output.
 
 ```bash
-.venv/bin/python live_transcribe.py              # record 5s and transcribe
-.venv/bin/python live_transcribe.py --seconds 8  # longer clip
-.venv/bin/python live_transcribe.py --loop        # repeat until Ctrl+C
+.venv/bin/python live_transcribe.py                       # auto silence threshold
+.venv/bin/python live_transcribe.py --min-silence 300     # cut on shorter pauses
+.venv/bin/python live_transcribe.py --silence-thresh -38  # set it manually
 .venv/bin/python live_transcribe.py --list-devices
 ```
 
-It prints the captured level (`rms`, `dBFS`, `peak`) and the transcript, plus how
-long transcription took. Requirements: `arecord` (package `alsa-utils`) and
-`numpy`; start the server first.
+At startup the background level is measured and the silence threshold is set
+just above it (shown in the banner). Requirements: `arecord` (package
+`alsa-utils`), `numpy`, `pydub`; start the server first.
 
 ## ❤️ Credits & Acknowledgements
 

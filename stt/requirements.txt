@@ -1,8 +1,9 @@
-# Local (non-Docker) dependencies for record_transcribe.py
+# Local (non-Docker) dependencies for record_transcribe.py / live_transcribe.py
 faster-whisper>=1.2,<2
 sounddevice>=0.5
 soundfile>=0.13
 numpy>=1.26
+pydub>=0.25
 
 # CUDA runtime libraries for CTranslate2 (prebuilt wheels, no system CUDA toolkit needed)
 nvidia-cublas-cu12>=12.4
