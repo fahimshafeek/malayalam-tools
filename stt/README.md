@@ -70,6 +70,24 @@ curl http://localhost:8081/inference \
   -F "language=ml"
 ```
 
+## 🎙️ Live Terminal Transcription
+
+`live_transcribe.py` captures your microphone and streams a live transcript to
+the terminal until you press Ctrl+C. It talks to the same server, so start the
+container first.
+
+```bash
+.venv/bin/python live_transcribe.py                       # Malayalam (default)
+.venv/bin/python live_transcribe.py --device plughw:2,0   # pick a mic
+.venv/bin/python live_transcribe.py --list-devices
+.venv/bin/python live_transcribe.py --language auto       # auto-detect
+```
+
+Requirements: `arecord` (package `alsa-utils`) and `numpy`. The script measures
+your background noise at startup and adapts its speech threshold; tune it with
+`--noise-multiplier` / `--energy-threshold` if it triggers on noise or misses
+quiet speech.
+
 ## ❤️ Credits & Acknowledgements
 
 This project stands on the shoulders of giants. A special thanks to:
