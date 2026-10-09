@@ -73,20 +73,20 @@ curl http://localhost:8081/inference \
 ## 🎙️ Live Terminal Transcription
 
 `live_transcribe.py` captures your microphone and streams a live transcript to
-the terminal until you press Ctrl+C. It talks to the same server, so start the
-container first.
+the terminal until you press Ctrl+C. There is **no voice-activity threshold** —
+audio is transcribed continuously so nothing gets clipped, and a live readout
+shows the raw level (`rms`, `dBFS`, `peak`) so you can see the real numbers. It
+talks to the same server, so start the container first.
 
 ```bash
 .venv/bin/python live_transcribe.py                       # Malayalam (default)
 .venv/bin/python live_transcribe.py --device plughw:2,0   # pick a mic
 .venv/bin/python live_transcribe.py --list-devices
-.venv/bin/python live_transcribe.py --language auto       # auto-detect
+.venv/bin/python live_transcribe.py --window 12 --step 1  # commit cadence
 ```
 
-Requirements: `arecord` (package `alsa-utils`) and `numpy`. The script measures
-your background noise at startup and adapts its speech threshold; tune it with
-`--noise-multiplier` / `--energy-threshold` if it triggers on noise or misses
-quiet speech.
+Requirements: `arecord` (package `alsa-utils`) and `numpy`. Transcription speed
+is limited by the server — the GPU build is much faster than CPU.
 
 ## ❤️ Credits & Acknowledgements
 
