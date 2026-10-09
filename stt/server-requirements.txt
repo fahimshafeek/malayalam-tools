@@ -1,0 +1,10 @@
+# Dependencies for the containerised faster-whisper ASR server (app.py)
+faster-whisper>=1.2,<2
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+numpy>=1.26
+
+# CUDA runtime libraries for CTranslate2 (prebuilt wheels, no system CUDA toolkit needed)
+nvidia-cublas-cu12>=12.4
+nvidia-cudnn-cu12>=9.0

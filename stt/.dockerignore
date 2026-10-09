@@ -1,0 +1,23 @@
+# Build context for the whisper.cpp CUDA image.
+#
+# Only `public/` and `entrypoint.sh` are used by the Dockerfile, so keep the
+# context tiny — the model and the Python venv are mounted / not needed.
+
+# Model weights (mounted at runtime via ./models:/models).
+models/
+
+# Python environment and caches (faster-whisper setup, unused by this image).
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local audio samples.
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Development / VCS files.
+.git/
+.gitignore
+*.log

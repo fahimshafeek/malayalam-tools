@@ -1,0 +1,42 @@
+services:
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # CUDA compute capability to compile kernels for.
+        #   89 = Ada (RTX 40xx) | 86 = Ampere (RTX 30xx) | 75 = Turing | 61 = Pascal
+        # Use a semicolon-separated list to support several GPUs, e.g. "89;86".
+        CUDA_ARCHITECTURES: "89"
+        # whisper.cpp git ref to build. Pin a tag (e.g. "v1.7.4") for reproducible
+        # images, or leave "master" to always build the latest.
+        WHISPER_CPP_REF: "master"
+    image: stt-whisper:latest
+    container_name: whisper_server
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models:/models
+    # GPU access. "gpus: all" is the modern Compose form (v2.30+); it replaces
+    # the swarm-only deploy.resources.reservations.devices block.
+    gpus: all
+    command:
+      - "-m"
+      - "/models/ggml-model-q4_0.bin"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--public"
+      - "/app/public"
+      # CPU threads used for the non-GPU parts of the pipeline.
+      - "-t"
+      - "6"
+      # Force Malayalam (the fine-tuned model is Malayalam-only). Use "auto" to
+      # let the server detect the spoken language instead.
+      - "-l"
+      - "ml"
+    restart: unless-stopped
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility

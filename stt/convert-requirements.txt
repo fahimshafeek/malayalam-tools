@@ -1,0 +1,8 @@
+# Extra dependencies needed ONLY to convert the Malayalam Whisper model to
+# CTranslate2 (run once). Inference needs `requirements.txt` instead.
+ctranslate2>=4.0
+transformers>=4.40
+
+# CPU build of PyTorch keeps the download small:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch

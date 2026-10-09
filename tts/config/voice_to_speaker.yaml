@@ -1,0 +1,58 @@
+tts-1:
+  # Meera (Female Malayalam) - Default
+  alloy:
+    model: voices/piper/ml_IN-meera-medium.onnx
+  meera:
+    model: voices/piper/ml_IN-meera-medium.onnx
+  ml_IN-meera-medium:
+    model: voices/piper/ml_IN-meera-medium.onnx
+  nova:
+    model: voices/piper/ml_IN-meera-medium.onnx
+  shimmer:
+    model: voices/piper/ml_IN-meera-medium.onnx
+
+  # Arjun (Male Malayalam)
+  arjun:
+    model: voices/piper/ml_IN-arjun-medium.onnx
+  ml_IN-arjun-medium:
+    model: voices/piper/ml_IN-arjun-medium.onnx
+  echo:
+    model: voices/piper/ml_IN-arjun-medium.onnx
+  fable:
+    model: voices/piper/ml_IN-arjun-medium.onnx
+  onyx:
+    model: voices/piper/ml_IN-arjun-medium.onnx
+tts-1-hd:
+  alloy-alt:
+    model: xtts
+    speaker: voices/alloy-alt.wav
+  alloy:
+    model: xtts
+    speaker: voices/alloy.wav
+  echo:
+    model: xtts
+    speaker: voices/echo.wav
+  fable:
+    model: xtts
+    speaker: voices/fable.wav
+  onyx:
+    model: xtts
+    speaker: voices/onyx.wav
+  nova:
+    model: xtts
+    speaker: voices/nova.wav
+  shimmer:
+    model: xtts
+    speaker: voices/shimmer.wav
+  me:
+    model: xtts_v2.0.2 # you can specify an older xtts version
+    speaker: voices/me.wav # this could be you
+    language: auto
+    enable_text_splitting: True
+    length_penalty: 1.0
+    repetition_penalty: 10
+    speed: 1.0
+    temperature: 0.75
+    top_k: 50
+    top_p: 0.85
+    comment: You can add a comment here also, which will be persistent and otherwise ignored.

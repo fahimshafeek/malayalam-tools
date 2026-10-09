@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# --- Model weights ---
+# Not committed: fetch with `stt/download_model.sh` and `tts/get_voices.sh`.
+/stt/models/
+/tts/models/*.onnx
+
+# --- Local audio samples ---
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# --- Logs / OS / editors ---
+*.log
+.DS_Store
+.idea/
+.vscode/
